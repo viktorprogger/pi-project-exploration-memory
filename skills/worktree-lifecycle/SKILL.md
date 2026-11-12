@@ -17,7 +17,7 @@ Treat a worktree as an isolated agent workspace with project-local context that 
    - `.mcp.json`
    - other project-local agent/context/memory/skill files found during inspection
 4. Copy configuration and documents as project files, not as Git metadata. Do not copy `.git`, dependency directories, secrets, caches, generated runtime state, or IDE state. Avoid copying credentials embedded in local configuration; inspect questionable files first.
-5. Handle an untracked local `.pi/project-exploration-memory` explicitly. Ask whether continuity is wanted or inspect the user's stated intent; copy it only intentionally. Never assume Git carries it. Memory is per-worktree and has no concurrent-writer guarantee.
+5. Handle untracked local project memory explicitly. Ask whether continuity is wanted or inspect the user's stated intent; copy it only intentionally. Never assume Git carries local memory.
 6. Verify the destination scaffold, symlink targets, repository identity, and status before starting work. Record what was intentionally omitted.
 
 Do not silently overwrite existing destination context or memory. Stop and ask before merging two local scaffolds or replacing non-empty files.
@@ -35,7 +35,7 @@ Do not silently overwrite existing destination context or memory. Stop and ask b
 
 1. Confirm the target path and repository association.
 2. Confirm no active work remains and record/export anything that must survive.
-3. Inspect tracked, untracked, and ignored changes, including `.pi/project-exploration-memory`.
+3. Inspect tracked, untracked, and ignored changes, including local project memory.
 4. Prefer normal `git worktree remove <path>` so Git performs the ordinary lifecycle checks.
 5. Use force only with explicit authorization naming the target and accepting loss. Never use destructive cleanup as a default or hide failures with broad removal commands.
 6. Verify with `git worktree list` and, when appropriate, `git worktree prune`. Confirm the directory and worktree metadata have the expected state.

@@ -9,17 +9,28 @@ pi install -l /absolute/path/to/pi-project-exploration-memory
 pi -e /absolute/path/to/pi-project-exploration-memory
 ```
 
-The package uses Pi's current working directory by default. Every document is stored below `.pi/project-exploration-memory/`. Pass `project` to select an explicit local directory; relative paths resolve from Pi's cwd. There are no provider, network, UI, timer, or remote URL effects.
+The package uses Pi's current project by default. Pass `project` to select another project context. There are no provider, network, UI, timer, or remote URL effects.
+
+## Skills
+
+The package exposes three focused skills: `project-exploration-memory` for scout research and PEM authoring, `project-memory-reading` for role-aware catalog-first evidence and freshness-aware reading, and `project-memory-subagent-delegation` for task-scoped context and launcher-compatible handoff. Pi discovers each skill recursively from its `SKILL.md`.
+
+## Workflow and handoff
+
+The lead obtains project knowledge only from task-relevant PEM details and re-reads verified scout publications. Explorers/scouts are the source-research and PEM-writing role; bounded authors and verifiers may inspect only their exact assigned source, diffs, and tests. Missing, stale, insufficient, or contradictory knowledge routes through the lead to a scout; unavailable PEM blocks dependent claims.
+
+Every delegate receives actual relevant PEM documents with project/worktree identity, source evidence, integrity/freshness/status, unknowns, and newest-five history. The runner constructs the child prompt without expanding PEM macros itself. A child may expand real unprotected `[[pem:slug]]` references only when its PEM extension is loaded, its chosen input source supports the hook, the correct project/worktree context is present, and limits are respected; the current explorer configuration can meet this route, while extension-disabled implementer/verifier sessions cannot. Otherwise provide the equivalent full expanded-details snapshot; never use bare macros, guessed slugs, or irrelevant documents. See the bundled skills for cache-prefix and context-limit rules.
 
 ## Tools
 
-Exactly five tools are registered:
+Exactly six tools are registered:
 
-- `project_memory_catalog({ query?, project? })` searches slug, title, and description.
+- `project_memory_catalog({ query?, project? })` matches every whitespace-separated, case-insensitive query token as a substring in slug, title, or description; an empty query returns all entries, and content/history are not searched.
 - `project_memory_details({ slugs, view?, project? })` returns current content, captures, freshness, and the latest five history entries. `editable` view restores exact source links for editing.
 - `project_memory_write({ slug, title, description, content, reason, project? })` creates or replaces current content.
 - `project_memory_edit({ slug, edits, reason, title?, description?, project? })` applies unique exact replacements to editable current content.
 - `project_memory_history({ slug, limit?, cursor?, project? })` returns bounded newest-first history pages with an opaque stable cursor.
+- `project_memory_retire({ slug, mode, reason, replacements?, project? })` archives or supersedes a memory. `archive` preserves the document as historical content; `supersede` verifies replacement preconditions and then deletes the target, with best-effort cleanup and no cross-file rollback guarantee.
 
 Mutation reasons and history timestamps are recorded as UTC ISO timestamps. Details are intentionally compact for model use; inspect editable details immediately before an exact edit.
 
@@ -31,23 +42,19 @@ Macros are ignored in ordinary inline code and fenced Markdown code. Inline back
 
 All occurrences expand in source order; repeated slugs are retrieved once in first-occurrence order. Selection is local to the input event's `ctx.cwd`; a project selected by an earlier tool call is not reused. Only `interactive` and `rpc` input is processed; extension-originated input is untouched. Retrieval has the same content, freshness/source occurrences, integrity warnings, and newest-five history reasons as ordinary details retrieval.
 
-The transformed input, including surrounding text and expanded documents, must be at most 64 KiB UTF-8 at this hook; later Pi template or skill expansion is outside this bound. Images are preserved. Malformed macros, retrieval/rendering failures, and overflow fail closed: input is handled and the original prompt is never delivered, even if best-effort notification fails. Macros remain provider-free and do not change the exactly five tools above.
+The transformed input, including surrounding text and expanded documents, must be at most 64 KiB UTF-8 at this hook; later Pi template or skill expansion is outside this bound. Images are preserved. Malformed macros, retrieval/rendering failures, and overflow fail closed: input is handled and the original prompt is never delivered, even if best-effort notification fails. Macros remain provider-free and do not change the six tools above.
 
-## Current-state files and consistency
+## Persistence and consistency
 
-The current state uses only a schema-2 `catalog.json` and one `documents/<slug>.md` per slug. `catalog.json` remains JSON; each Markdown document has an optional UTF-8 BOM, an opening `---` line, strict schema-2 multiline YAML front matter with exactly `schemaVersion`, `slug`, and `captures`, a closing `---` line, and a required LF/CRLF separator before the exact body. The body may be empty and its leading/trailing newlines are preserved. The catalog stores one lowercase `documentSha256` over the exact complete Markdown bytes as written, including front matter delimiters, YAML, separators, and body; there are no sidecars, secondary binding hashes, or revision directories.
+Use the six tools to read and mutate project memory. The extension owns persistence, integrity checks, freshness tracking, and recovery boundaries; invalid or inconsistent state is reported rather than silently repaired.
 
-Old JSON front matter is deliberately rejected. This is a format cutover: runtime has no JSON fallback, migration, or repair path. A truly empty project has an empty catalog and permits first publication. A missing catalog beside any persisted artifact is an inconsistent-state error. Markdown and catalog replacement use independent temporary-file-plus-rename operations in Markdown → catalog order. A readable document whose observed hash differs from the catalog hash is returned with an explicit warning so an agent can inspect and recover it with an ordinary write/edit. Invalid UTF-8, malformed YAML front matter/catalog, unsafe paths, missing required documents, and unsupported schema-1/revision artifacts remain hard errors; the extension never chooses a winning file or repairs state automatically.
-
-The checked-in documents were regenerated once through the canonical writer; historical `.history` records are not rewritten by the format cutover. These independent replacements are not a transaction and do not prevent unsupported concurrent writers or power-loss races. There are no SQLite databases, locks, commits, CLI, or Git operations.
-
-Git tracking and commit policy are user-controlled. The extension neither edits Git metadata nor decides whether memory files should be tracked. Worktree setup, coordination, and lifecycle remain the responsibility of the appropriate skills; this package only stores and retrieves exploration memory.
+Git tracking and commit policy are user-controlled. The extension neither edits Git metadata nor decides whether memory files should be tracked.
 
 ## Reference grammar and freshness
 
 Use project-relative GitHub-style anchors such as `src/orders.ts#L35-L50` or `[validation](src/orders.ts#L35-L50)`. Do not wrap source references in backticks in ordinary prose: inline-code references and fenced-code references are ignored. The only compatibility exception is a complete single-backtick anchor used as the entire Markdown list-item token, such as `- \`src/orders.ts#L35-L50\``. Paths must be UTF-8 regular files with no absolute paths, traversal, URLs, query strings, or malformed ranges.
 
-The service preserves captured source evidence in collision-safe codec blocks and keeps the original literal for editable retrieval. Freshness hashes the entire source file: unchanged captures are `valid`; changed, missing, or unreadable files are reported with path and inclusive ranges. A document with no references reports `all-valid (no-sources)`.
+The service preserves captured source evidence in collision-safe codec blocks and keeps the original literal for editable retrieval. Freshness hashes the entire source file: unchanged captures are `valid`; changed, missing, or unreadable files are reported with path and inclusive ranges. A document with no references reports `all-valid (no-sources)`. Catalog and details identify documents as `actual` or `archived`; archived documents remain readable, report `Freshness: not_applicable`, and bypass source reads. Archived documents cannot be written or edited. Use `archive` to preserve history; use `supersede` only when verified replacements exist, and handle controlled partial cleanup failures honestly.
 
 ## Development
 
