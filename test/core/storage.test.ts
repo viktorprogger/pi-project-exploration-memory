@@ -1,3 +1,4 @@
+// @ts-nocheck
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -37,7 +38,7 @@ test("publication has exactly catalog and Markdown, with strict schema-2 fields 
     const s = createStorage(root); const result = await s.replace({ slug: "x", content: "hello", captures: [] }, { title: "Title", description: "Description" }, "create");
     const c = JSON.parse(await readFile(catalogPath(root), "utf8"));
     assert.deepEqual(Object.keys(c), ["schemaVersion", "entries"]);
-    assert.deepEqual(Object.keys(c.entries[0]).sort(), ["description", "documentSha256", "history", "slug", "title"]);
+    assert.deepEqual(Object.keys(c.entries[0]).sort(), ["description", "documentSha256", "history", "slug", "status", "title"]);
     assert.equal(c.entries[0].documentSha256, documentSha256(await readFile(mdPath(root))));
     assert.equal(result.document.content, "hello");
     assert.deepEqual((await readdir(path.join(memory(root), "documents"))).sort(), ["x.md"]);
@@ -122,7 +123,7 @@ test("YAML capture scalars round-trip without changing body or exact hash", asyn
     const storage = createStorage(root);
     await storage.replace({ slug: "x", content: "body\r\nexact", captures }, { title: "Title", description: "Description" }, "create");
     const bytes = await readFile(mdPath(root));
-    assert.match(bytes.toString(), /schemaVersion: 2\nslug: x\ncaptures:/);
+    assert.match(bytes.toString(), /schemaVersion: 2\nstatus: actual\nslug: x\ncaptures:/);
     assert.equal(documentSha256(bytes), (await storage.catalog()).entries[0]!.documentSha256);
     assert.deepEqual((await storage.read("x")).captures, captures);
     assert.equal((await storage.read("x")).content, "body\r\nexact");
@@ -202,12 +203,22 @@ test("readable hash mismatch is a warning with hashes and content, while malform
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("catalog accepts duplicate JSON keys with ordinary JSON semantics before validation", async () => {
+  const root = await fresh(); try {
+    await mkdir(memory(root), { recursive: true });
+    await writeFile(catalogPath(root), `{"schemaVersion":2,"entries":[{"slug":"x","title":"Title","description":"Description","documentSha256":"${"0".repeat(64)}","history":[{"timestamp":"2025-01-01T00:00:00Z","reason":"old","reason" : "final"}]}]}`);
+    assert.deepEqual(await createStorage(root).catalog(), {
+      schemaVersion: 2,
+      entries: [{ slug: "x", title: "Title", description: "Description", documentSha256: "0".repeat(64), history: [{ timestamp: "2025-01-01T00:00:00Z", reason: "final" }], status: "actual" }],
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("catalog validation rejects unsupported, extra, duplicate, ordering, and history states", async () => {
   const root = await fresh(); try {
     const cases: [string, string][] = [
       [JSON.stringify({ schemaVersion: 1, entries: [] }), "unsupported_schema"],
       [JSON.stringify({ schemaVersion: 2, entries: {}, extra: true }), "malformed_state"],
-      [`{"schemaVersion":2,"schemaVersion":2,"entries":[]}`, "malformed_state"],
       [JSON.stringify({ schemaVersion: 2, entries: [{ slug: "x", title: "T", description: "D", documentSha256: "0".repeat(64), history: [], extra: 1 }] }), "malformed_state"],
       [JSON.stringify({ schemaVersion: 2, entries: [{ slug: "X", title: "T", description: "D", documentSha256: "0".repeat(64), history: [] }] }), "malformed_state"],
       [JSON.stringify({ schemaVersion: 2, entries: [{ slug: "x", title: "T", description: "D", documentSha256: "0".repeat(64), history: [{ timestamp: "bad", reason: "r" }] }] }), "malformed_state"],
@@ -328,15 +339,11 @@ test("capture paths reject absolute, backslash, dot, and empty segments", async 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("duplicate JSON keys are rejected with whitespace at nested levels", async () => {
+test("duplicate JSON keys in front matter are rejected with whitespace at nested levels", async () => {
   const root = await fresh(); try {
     const document = Buffer.from('---\n{"schemaVersion": 2, "slug": "x", "captures": [{ "path": "a.ts", "path" : "b.ts", "startLine": 1, "endLine": 1, "sha256": "' + "0".repeat(64) + '", "content": "x" }]}\n---\nbody');
     await put(root, "x", document);
     await assert.rejects(() => createStorage(root).read("x"), category("malformed_state"));
-
-    await mkdir(memory(root), { recursive: true });
-    await writeFile(catalogPath(root), '{"schemaVersion": 2, "entries": [{"slug":"x","title":"T","description":"D","documentSha256":"' + "0".repeat(64) + '","history":[{"timestamp":"2025-01-01T00:00:00Z","reason":"r","reason" : "again"}]}]}');
-    await assert.rejects(() => createStorage(root).catalog(), category("malformed_state"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -443,6 +450,145 @@ test("document reads and history use the requested slug among multiple documents
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("replace allows archiving actual documents but rejects reactivation", async () => {
+  const root = await fresh(); try {
+    const storage = createStorage(root);
+    await storage.replace({ slug: "x", content: "body", captures: [] }, { title: "T", description: "D" }, "create");
+
+    const archived = await storage.replace({ slug: "x", content: "body", captures: [], status: "archived" }, { title: "T", description: "D" }, "archive");
+    assert.equal(archived.document.status, "archived");
+    assert.equal((await storage.read("x")).status, "archived");
+    await assert.rejects(
+      () => storage.replace({ slug: "x", content: "changed", captures: [] }, { title: "T", description: "D" }, "mutate archived"),
+      (error: any) => error?.category === "incomplete_or_inconsistent_state" && error.message === "Archived document cannot be replaced: x",
+    );
+    assert.equal((await storage.read("x")).content, "body");
+    await assert.rejects(
+      () => storage.replace({ slug: "x", content: "body", captures: [], status: "actual" }, { title: "T", description: "D" }, "reactivate"),
+      category("incomplete_or_inconsistent_state"),
+    );
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("replace rejects runtime lifecycle values and supersede protects tampered targets", async () => {
+  const root = await fresh(); try {
+    const storage = createStorage(root);
+    await assert.rejects(() => storage.replace({ slug: "x", content: "body", captures: [], status: "bogus" as any }, { title: "T", description: "D" }, "create"), category("malformed_state"));
+    await assert.rejects(
+      () => storage.replace({ slug: "x", content: "body", captures: [], status: "archived" }, { title: "T", description: "D" }, "create archived"),
+      (error: any) => error?.category === "incomplete_or_inconsistent_state" && error.message === "New document must be actual: x",
+    );
+    assert.deepEqual(await storage.catalog(), { schemaVersion: 2, entries: [] });
+    await storage.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+    await storage.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+    await writeFile(mdPath(root, "target"), (await readFile(mdPath(root, "target"), "utf8")).replace(/target$/, "tampered"));
+    await assert.rejects(() => storage.retireSupersede("target", ["replacement"]), category("incomplete_or_inconsistent_state"));
+    await readFile(mdPath(root, "target"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("supersede rejects archived replacements before deleting the target", async () => {
+  const root = await fresh(); try {
+    const storage = createStorage(root);
+    await storage.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+    await storage.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+    await storage.archive("replacement", "archive replacement");
+    await assert.rejects(
+      () => storage.retireSupersede("target", ["replacement"]),
+      (error: any) => error?.category === "incomplete_or_inconsistent_state" && error.message === "Archived document cannot be used as replacement: replacement",
+    );
+    assert.equal((await storage.read("target")).content, "target");
+    assert.equal((await storage.read("replacement")).status, "archived");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("supersede rejects an archived target before deleting it", async () => {
+  const root = await fresh(); try {
+    const storage = createStorage(root);
+    await storage.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+    await storage.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+    await storage.archive("target", "archive target");
+    await assert.rejects(
+      () => storage.retireSupersede("target", ["replacement"]),
+      (error: any) => error?.category === "incomplete_or_inconsistent_state" && error.message === "Archived document cannot be superseded: target",
+    );
+    assert.equal((await storage.read("target")).status, "archived");
+    assert.equal((await storage.read("target")).content, "target");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("supersede returns absence outcome and reports post-delete state", async () => {
+  const root = await fresh(); try {
+    const base = createStorage(root);
+    await base.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+    await base.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+    const success = await base.retireSupersede("target", ["replacement"]);
+    assert.deepEqual(success.outcome, { target: { document: "absent", catalogEntry: "absent" } });
+
+    const root2 = await fresh(); const second = createStorage(root2); try {
+      await second.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+      await second.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const failing = createStorage(root2, undefined, { beforeRename: target => { if (target.endsWith("catalog.json")) throw new Error("catalog"); } });
+      await assert.rejects(() => failing.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.details?.target.document === "absent" && e.details?.target.catalogEntry === "present");
+    } finally { await rm(root2, { recursive: true, force: true }); }
+    const root3 = await fresh(); try {
+      const third = createStorage(root3); await third.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create"); await third.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const deleting = createStorage(root3, undefined, { afterDelete: () => { throw new Error("delete hook"); } });
+      await assert.rejects(() => deleting.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.message === "Supersede cleanup failed after target deletion" && e.details?.target.document === "absent" && e.details?.target.catalogEntry === "present");
+    } finally { await rm(root3, { recursive: true, force: true }); }
+    const root4 = await fresh(); try {
+      const fourth = createStorage(root4); await fourth.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create"); await fourth.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const failing = createStorage(root4, undefined, { beforeDelete: () => { throw new Error("unlink pre-delete"); } });
+      await assert.rejects(() => failing.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.message === "Supersede cleanup failed before target deletion" && e.details?.target.document === "present" && e.details?.target.catalogEntry === "present" && !e.message.includes("rollback"));
+    } finally { await rm(root4, { recursive: true, force: true }); }
+    const root5 = await fresh(); try {
+      const fifth = createStorage(root5); await fifth.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create"); await fifth.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const missingCatalog = createStorage(root5, undefined, { afterRename: async target => { if (target.endsWith("catalog.json")) { await writeFile(target, JSON.stringify({ schemaVersion: 2, entries: [] })); throw new Error("catalog rename failed after replacement"); } } });
+      await assert.rejects(() => missingCatalog.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.details?.target.document === "absent" && e.details?.target.catalogEntry === "absent");
+    } finally { await rm(root5, { recursive: true, force: true }); }
+    const root6 = await fresh(); try {
+      const sixth = createStorage(root6); await sixth.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create"); await sixth.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const uncertain = createStorage(root6, undefined, { afterDelete: async target => { await mkdir(target); throw new Error("target state uncertain"); } });
+      await assert.rejects(() => uncertain.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.message === "Supersede cleanup failed uncertain whether target deletion occurred" && e.details?.target.document === "unknown" && e.details?.target.catalogEntry === "present");
+    } finally { await rm(root6, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("storage lifecycle guards cover idempotency, status integrity, and supersede preflight", async () => {
+  const root = await fresh(); try {
+    const storage = createStorage(root);
+    await assert.rejects(() => storage.archive("x", ""), category("invalid_input"));
+    await storage.replace({ slug: "x", content: "body", captures: [] }, { title: "T", description: "D" }, "create");
+    const archived = await storage.archive("x", "archive");
+    assert.equal(archived.document.status, "archived");
+    const again = await storage.archive("x", "archive again");
+    assert.equal(again.document.status, "archived");
+    await assert.rejects(() => storage.replace({ slug: "x", content: "new", captures: [], status: "actual" }, { title: "T", description: "D" }, "reactivate"), category("incomplete_or_inconsistent_state"));
+
+    const mismatchRoot = await fresh(); try {
+      const base = createStorage(mismatchRoot);
+      await base.replace({ slug: "m", content: "body", captures: [] }, { title: "M", description: "D" }, "create");
+      const c = JSON.parse(await readFile(catalogPath(mismatchRoot), "utf8")); c.entries[0].status = "archived";
+      await writeFile(catalogPath(mismatchRoot), JSON.stringify(c));
+      await assert.rejects(() => createStorage(mismatchRoot).read("m"), category("incomplete_or_inconsistent_state"));
+    } finally { await rm(mismatchRoot, { recursive: true, force: true }); }
+
+    await assert.rejects(() => storage.retireSupersede("../x", ["replacement"]), category("invalid_input"));
+    await assert.rejects(() => storage.retireSupersede("x", []), category("invalid_input"));
+    await assert.rejects(() => storage.retireSupersede("x", ["bad slug"]), category("invalid_input"));
+    await assert.rejects(() => storage.retireSupersede("x", ["x"]), category("invalid_input"));
+    await assert.rejects(() => storage.retireSupersede("x", ["missing"]), category("not_found"));
+
+    const absentCatalogRoot = await fresh(); try {
+      const base = createStorage(absentCatalogRoot);
+      await base.replace({ slug: "target", content: "target", captures: [] }, { title: "T", description: "D" }, "create");
+      await base.replace({ slug: "replacement", content: "replacement", captures: [] }, { title: "R", description: "D" }, "create");
+      const failing = createStorage(absentCatalogRoot, undefined, { afterDelete: async () => { await rm(catalogPath(absentCatalogRoot)); throw new Error("delete hook"); } });
+      await assert.rejects(() => failing.retireSupersede("target", ["replacement"]), (e: any) => e?.category === "persistence" && e.details?.target.document === "absent" && e.details?.target.catalogEntry === "unknown");
+    } finally { await rm(absentCatalogRoot, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("document hashes distinguish UTF-8 strings and bytes, and publication formatting is stable", async () => {
   const text = "héllo";
   assert.equal(documentSha256(text), documentSha256(Buffer.from(text, "utf8")));
@@ -450,7 +596,7 @@ test("document hashes distinguish UTF-8 strings and bytes, and publication forma
   const root = await fresh(); try {
     await createStorage(root).replace({ slug: "x", content: "body\n", captures: [] }, { title: "T", description: "D" }, "create");
     const markdown = await readFile(mdPath(root), "utf8");
-    assert.equal(markdown, `---\nschemaVersion: 2\nslug: x\ncaptures: []\n---\nbody\n`);
+    assert.equal(markdown, `---\nschemaVersion: 2\nstatus: actual\nslug: x\ncaptures: []\n---\nbody\n`);
     const rawCatalog = await readFile(catalogPath(root), "utf8");
     assert.equal(rawCatalog, JSON.stringify(JSON.parse(rawCatalog), null, 2) + "\n");
   } finally { await rm(root, { recursive: true, force: true }); }

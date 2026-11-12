@@ -3,9 +3,11 @@
 node_modules/
 coverage/
 .stryker-tmp/
+.stryker-incremental.json
 stryker-report/
 *.tsbuildinfo
 *.log
+.history/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

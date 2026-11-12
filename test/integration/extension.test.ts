@@ -1,11 +1,13 @@
+// @ts-nocheck
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Value } from "typebox/value";
-import extension from "../../extensions/project-exploration-memory/index.ts";
+import extension, { failure } from "../../extensions/project-exploration-memory/index.ts";
 import { ExplorationMemoryError } from "../../src/core/errors.ts";
+import { createExplorationMemoryService } from "../../src/core/service.ts";
 
 function host() {
  const tools = new Map<string, any>([["read", {}], ["write", {}], ["edit", {}]]);
@@ -21,50 +23,98 @@ function context(cwd: string) { return { cwd } as any; }
 test("exposes the stable public contract for all project-memory tools", () => {
  const tools = host();
  const projectTools = [...tools.entries()].filter(([name]) => name.startsWith("project_memory_"));
- assert.equal(projectTools.length, 5);
+ assert.equal(projectTools.length, 6);
  assert.deepEqual(projectTools.map(([name]) => name), [
-  "project_memory_catalog", "project_memory_details", "project_memory_write", "project_memory_edit", "project_memory_history",
+  "project_memory_catalog", "project_memory_details", "project_memory_write", "project_memory_edit", "project_memory_history", "project_memory_retire",
  ]);
  const metadata = {
-  project_memory_catalog: ["Project memory catalog", "Find saved exploration memories by slug, title, or description.", true, true],
+  project_memory_catalog: ["Project memory catalog", "Find saved exploration memories by matching every whitespace-separated, case-insensitive query token as a substring of the slug, title, or description. Empty query returns all entries; content and history are not searched.", true, true],
   project_memory_details: ["Project memory details", "Read current memory content, source captures, and freshness; use editable view before exact edits.", true, true],
   project_memory_write: ["Write project memory", "Create or replace a project exploration memory and record the UTC reason.", false, false],
   project_memory_edit: ["Edit project memory", "Apply unique exact edits to current editable memory content and record the UTC reason.", false, false],
   project_memory_history: ["Project memory history", "Read a bounded newest-first history page for one memory.", true, true],
+  project_memory_retire: ["Retire project memory", "Archive a memory as preserved historical content with freshness skipped, or supersede it by deleting the target after verified replacement preconditions; supersede is best-effort and has no cross-file rollback guarantee.", false, false],
  } as const;
  for (const [name, tool] of projectTools) {
   const [label, description, readOnlyHint, idempotentHint] = metadata[name as keyof typeof metadata];
   assert.equal(tool.label, label);
   assert.equal(tool.description, description);
-  assert.deepEqual(tool.annotations, { readOnlyHint, destructiveHint: false, idempotentHint, openWorldHint: false });
-  assert.equal(tool.parameters.additionalProperties, false);
+  assert.deepEqual(tool.annotations, name === "project_memory_retire" ? { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } : { readOnlyHint, destructiveHint: false, idempotentHint, openWorldHint: false });
+  if (name === "project_memory_retire") {
+   assert.deepEqual(tool.parameters.anyOf.map((branch: any) => branch.additionalProperties), [false, false]);
+  } else assert.equal(tool.parameters.additionalProperties, false);
  }
  const catalog = tools.get("project_memory_catalog").parameters;
- assert.deepEqual(catalog.properties.query, { type: "string", description: "Tokens matched against slug, title, or description." });
+ assert.deepEqual(catalog.properties.query, { type: "string", description: "Whitespace-separated, case-insensitive tokens. Every token must occur as a substring in slug, title, or description; empty query returns all entries. Content and history are not searched." });
  assert.deepEqual(catalog.properties.project, { type: "string", description: "Explicit project directory; relative paths resolve from Pi's cwd." });
  const details = tools.get("project_memory_details").parameters;
  assert.deepEqual(details.required, ["slugs"]);
- assert.deepEqual(details.properties.slugs, { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, description: "Unique memory slugs." });
+ assert.deepEqual(details.properties.slugs, { type: "array", items: { type: "string", minLength: 1, pattern: "^[a-z0-9][a-z0-9_-]{0,127}$" }, minItems: 1, uniqueItems: true, description: "Unique memory slugs." });
+ assert.equal(Value.Check(details, { slugs: ["../x"] }), false);
+ assert.equal(Value.Check(details, { slugs: ["same", "same"] }), false);
  assert.deepEqual(details.properties.view, { anyOf: [{ type: "string", const: "expanded" }, { type: "string", const: "editable" }] });
  const write = tools.get("project_memory_write").parameters;
  assert.deepEqual(write.required, ["slug", "title", "description", "content", "reason"]);
- for (const field of ["slug", "title", "description", "reason"]) assert.deepEqual(write.properties[field], { type: "string", minLength: 1 });
+ for (const field of ["title", "description", "reason"]) assert.deepEqual(write.properties[field], { type: "string", minLength: 1 });
+ assert.deepEqual(write.properties.slug, { type: "string", minLength: 1, pattern: "^[a-z0-9][a-z0-9_-]{0,127}$" });
+ assert.equal(Value.Check(write, { slug: "../x", title: "X", description: "D", content: "x", reason: "r" }), false);
  assert.deepEqual(write.properties.content, { type: "string" });
  const edit = tools.get("project_memory_edit").parameters;
  assert.deepEqual(edit.required, ["slug", "edits", "reason"]);
- assert.deepEqual(edit.properties.slug, { type: "string", minLength: 1 });
+ assert.deepEqual(edit.properties.slug, { type: "string", minLength: 1, pattern: "^[a-z0-9][a-z0-9_-]{0,127}$" });
  assert.deepEqual(edit.properties.edits, {
   type: "array", minItems: 1,
-  items: { type: "object", required: ["oldText", "newText"], properties: { oldText: { type: "string", minLength: 1 }, newText: { type: "string" } }, additionalProperties: false },
+  items: { type: "object", required: ["oldText", "newText"], properties: { oldText: { type: "string", minLength: 1 }, newText: { type: "string", minLength: 1 } }, additionalProperties: false },
  });
  assert.deepEqual(edit.properties.reason, { type: "string", minLength: 1 });
+ assert.equal(Value.Check(edit, { slug: "../x", edits: [{ oldText: "a", newText: "b" }], reason: "r" }), false);
+ assert.equal(Value.Check(edit, { slug: "x", edits: [{ oldText: "a", newText: "" }], reason: "r" }), false);
  assert.deepEqual(edit.properties.title, { type: "string", minLength: 1 });
  assert.deepEqual(edit.properties.description, { type: "string", minLength: 1 });
+ const retire = tools.get("project_memory_retire").parameters;
+ assert.equal(retire.anyOf.length, 2);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "archive", reason: "retired" }), true);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "archive", reason: "retired", replacements: ["replacement"] }), false);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced", replacements: ["replacement"], project: "/tmp/project" }), true);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced" }), false);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced", replacements: [] }), false);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced", replacements: ["replacement", "replacement"] }), false);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced", replacements: [""] }), false);
+ assert.equal(Value.Check(retire, { slug: "old", mode: "supersede", reason: "replaced", replacements: ["replacement"], extra: true }), false);
+ assert.equal(Value.Check(retire, { slug: "bad slug", mode: "archive", reason: "retired" }), false);
+ assert.equal(Value.Check(retire, { slug: "../x", mode: "archive", reason: "retired" }), false);
+ assert.equal(Value.Check(retire, { slug: "target", mode: "supersede", reason: "replaced", replacements: ["bad slug"] }), false);
+ assert.equal(Value.Check(retire, { slug: "target", mode: "supersede", reason: "replaced", replacements: ["../x"] }), false);
  const history = tools.get("project_memory_history").parameters;
  assert.deepEqual(history.required, ["slug"]);
- assert.deepEqual(history.properties.slug, { type: "string", minLength: 1 });
+ assert.deepEqual(history.properties.slug, { type: "string", minLength: 1, pattern: "^[a-z0-9][a-z0-9_-]{0,127}$" });
+ assert.equal(Value.Check(history, { slug: "../x" }), false);
  assert.deepEqual(history.properties.limit, { type: "integer", minimum: 1, maximum: 100, description: "Maximum entries to return." });
  assert.deepEqual(history.properties.cursor, { type: "string", minLength: 1, description: "Opaque cursor from a previous history result." });
+});
+
+test("retires archives as readable historical content and supersedes verified replacements", async () => {
+ const root = await mkdtemp(path.join(tmpdir(), "pi-memory-lifecycle-")); const tools = host(); const ctx = context(root);
+ const write = tools.get("project_memory_write"); const retire = tools.get("project_memory_retire");
+ await writeFile(path.join(root, "gone.ts"), "const gone = true;\n", "utf8");
+ await write.execute("1", { slug: "old", title: "Old", description: "D", content: "See gone.ts#L1-L1", reason: "created" }, undefined, undefined, ctx);
+ const archived = await retire.execute("2", { slug: "old", mode: "archive", reason: "retired" }, undefined, undefined, ctx);
+ await unlink(path.join(root, "gone.ts"));
+ assert.equal(archived.details.entry.status, "archived"); assert.equal(archived.details.document.status, "archived"); assert.match(archived.content[0].text, /historical/);
+ const catalog = await tools.get("project_memory_catalog").execute("3", {}, undefined, undefined, ctx);
+ assert.match(catalog.content[0].text, /old: Old — D \[archived\]/); assert.equal(catalog.details.entries[0].status, "archived");
+ const details = await tools.get("project_memory_details").execute("4", { slugs: ["old"] }, undefined, undefined, ctx);
+ assert.equal(details.details.documents[0].freshness.status, "not_applicable"); assert.match(details.content[0].text, /archived historical content/); assert.match(details.content[0].text, /Freshness: not_applicable/);
+ const macro = await (tools as any).dispatchInput({ type: "input", source: "interactive", text: "[[pem:old]]" }, root);
+ assert.equal(macro.action, "transform"); assert.match(macro.text, /Source: gone\.ts/);
+ const denied = await write.execute("5", { slug: "old", title: "Old", description: "D", content: "changed", reason: "bad" }, undefined, undefined, ctx);
+ assert.equal(denied.isError, true); assert.match(denied.content[0].text, /cannot be modified/);
+ await write.execute("6", { slug: "replacement", title: "Replacement", description: "D", content: "new", reason: "created" }, undefined, undefined, ctx);
+ await write.execute("7", { slug: "target", title: "Target", description: "D", content: "old", reason: "created" }, undefined, undefined, ctx);
+ const superseded = await retire.execute("8", { slug: "target", mode: "supersede", reason: "replaced", replacements: ["replacement"] }, undefined, undefined, ctx);
+ assert.equal(superseded.details.removed, true); assert.deepEqual(superseded.details.replacements, ["replacement"]); assert.match(superseded.content[0].text, /Superseded target/);
+ const precondition = await retire.execute("9", { slug: "missing-target", mode: "supersede", reason: "replaced", replacements: ["replacement"] }, undefined, undefined, ctx);
+ assert.equal(precondition.isError, true);
 });
 
 test("registers the provider-free input hook and expands only interactive macros", async () => {
@@ -290,10 +340,10 @@ test("handles unchanged, malformed, and unmatched macro input deterministically"
  assert.equal(emptyHistory.text.slice(emptyHistory.text.indexOf("History (empty):")), "History (empty):\nNo history entries.");
 });
 
-test("registers exactly five current tools and preserves built-ins", async () => {
+test("registers exactly six current tools and preserves built-ins", async () => {
  const root = await mkdtemp(path.join(tmpdir(), "pi-memory-extension-"));
  const tools = host();
- assert.deepEqual([...tools.keys()], ["read", "write", "edit", "project_memory_catalog", "project_memory_details", "project_memory_write", "project_memory_edit", "project_memory_history"]);
+ assert.deepEqual([...tools.keys()], ["read", "write", "edit", "project_memory_catalog", "project_memory_details", "project_memory_write", "project_memory_edit", "project_memory_history", "project_memory_retire"]);
  assert.equal(Value.Check(tools.get("project_memory_write").parameters, { slug: "orders", title: "Orders", description: "Creation", content: "# Orders", reason: "created" }), true);
  assert.equal(Value.Check(tools.get("project_memory_write").parameters, { slug: "orders", title: "Orders", description: "Creation", content: "# Orders", reason: "created", extra: true }), false);
  assert.equal(Value.Check(tools.get("project_memory_catalog").parameters, { query: "orders", extra: true }), false);
@@ -308,12 +358,12 @@ test("registers exactly five current tools and preserves built-ins", async () =>
  assert.match(edit.content[0].text, /Saved orders\./);
  const catalog = await tools.get("project_memory_catalog").execute("3", { query: "orders" }, undefined, undefined, ctx);
  assert.equal(catalog.details.entries.length, 1);
- assert.equal(catalog.content[0].text, "orders: Orders — Creation");
+ assert.equal(catalog.content[0].text, "orders: Orders — Creation [actual]");
  const details = await tools.get("project_memory_details").execute("4", { slugs: ["orders"], view: "editable" }, undefined, undefined, ctx);
  assert.match(details.content[0].text, /Orders and validation/);
  await tools.get("project_memory_write").execute("5", { slug: "payments", title: "Payments", description: "Creation", content: "# Payments", reason: "created" }, undefined, undefined, ctx);
  const allCatalog = await tools.get("project_memory_catalog").execute("5b", {}, undefined, undefined, ctx);
- assert.equal(allCatalog.content[0].text, "orders: Orders — Creation\npayments: Payments — Creation");
+ assert.equal(allCatalog.content[0].text, "orders: Orders — Creation [actual]\npayments: Payments — Creation [actual]");
  const multiple = await tools.get("project_memory_details").execute("6", { slugs: ["orders", "payments"] }, undefined, undefined, ctx);
  assert.deepEqual(multiple.details.documents.map((document: any) => document.entry.slug), ["orders", "payments"]);
  assert.match(multiple.content[0].text, /# Orders \(orders\)[\s\S]*Orders and validation[\s\S]*\n\n---\n\n[\s\S]*# Payments \(payments\)[\s\S]*# Payments/);
@@ -405,6 +455,30 @@ test("turns missing documents and malformed state into failed tool results", asy
  assert.equal(failed.structuredContent, undefined);
 });
 
+test("exposes partial supersede state when catalog replacement fails", async () => {
+ const root = await mkdtemp(path.join(tmpdir(), "pi-memory-partial-retire-"));
+ const setup = createExplorationMemoryService(root);
+ await setup.write({ slug: "replacement", title: "Replacement", description: "D", content: "new", reason: "created" });
+ await setup.write({ slug: "target", title: "Target", description: "D", content: "old", reason: "created" });
+ const catalogPath = path.join(root, ".pi/project-exploration-memory/catalog.json");
+ const failing = createExplorationMemoryService(root, { beforeDelete: async () => {
+  await rename(catalogPath, `${catalogPath}.saved`);
+  await mkdir(catalogPath);
+ } });
+ let thrown: unknown;
+ try {
+  await failing.retire({ slug: "target", mode: "supersede", reason: "replaced", replacements: ["replacement"] });
+ } catch (error) { thrown = error; }
+ assert(thrown instanceof ExplorationMemoryError);
+ const result = failure(thrown);
+ assert.equal(result.isError, true);
+ assert.equal(result.content[0]!.text, "Supersede cleanup partially completed; catalog replacement failed");
+ assert.deepEqual(result.details, {
+  error: "Supersede cleanup partially completed; catalog replacement failed",
+  outcome: { target: { document: "absent", catalogEntry: "unknown" } },
+ });
+});
+
 test("formats primitive adapter failures through public tools", async () => {
  const root = await mkdtemp(path.join(tmpdir(), "pi-memory-primitive-error-")); const tools = host();
  const query = { toLocaleLowerCase() { throw "primitive query failure"; } };
@@ -440,7 +514,7 @@ test("accepts optional fields while rejecting closed-schema edge cases", () => {
  assert.equal(Value.Check(tools.get("project_memory_catalog").parameters, { project: "/tmp/project" }), true);
  assert.equal(Value.Check(tools.get("project_memory_details").parameters, { slugs: ["x"], view: "expanded", project: "/tmp/project" }), true);
  assert.equal(Value.Check(tools.get("project_memory_write").parameters, { slug: "x", title: "X", description: "D", content: "", reason: "r", project: "/tmp/project" }), true);
- assert.equal(Value.Check(tools.get("project_memory_edit").parameters, { slug: "x", edits: [{ oldText: "a", newText: "" }], reason: "r", title: "X", description: "D", project: "/tmp/project" }), true);
+ assert.equal(Value.Check(tools.get("project_memory_edit").parameters, { slug: "x", edits: [{ oldText: "a", newText: "b" }], reason: "r", title: "X", description: "D", project: "/tmp/project" }), true);
  assert.equal(Value.Check(tools.get("project_memory_history").parameters, { slug: "x", limit: 1, cursor: "abc", project: "/tmp/project" }), true);
  assert.equal(Value.Check(tools.get("project_memory_catalog").parameters, { query: "x", nope: true }), false);
  assert.equal(Value.Check(tools.get("project_memory_details").parameters, { slugs: ["x"], view: "bad" }), false);

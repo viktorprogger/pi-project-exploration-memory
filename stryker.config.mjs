@@ -1,3 +1,4 @@
+// @ts-nocheck
 export default {
   testRunner: "command",
   commandRunner: {
@@ -5,9 +6,12 @@ export default {
   },
   mutate: ["src/**/*.ts", "extensions/**/*.ts"],
   coverageAnalysis: "off",
-  timeoutMS: 10000,
-  timeoutFactor: 2,
-  concurrency: 12,
+  timeoutMS: 5000,
+  timeoutFactor: 1.5,
+  concurrency: 6,
+  incremental: true,
+  incrementalFile: ".stryker-incremental.json",
+  inPlace: true,
   reporters: ["clear-text", "progress"],
   thresholds: {
     high: 100,

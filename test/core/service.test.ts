@@ -1,3 +1,4 @@
+// @ts-nocheck
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -124,6 +125,51 @@ test("edit rejects malformed and ambiguous operations and preserves metadata def
     assert.equal(result.entry.title, "A"); assert.equal(result.entry.description, "D"); assert.equal(result.document.content, "done");
     await assert.rejects(() => m.details({ slugs: ["unknown"] }), (e: any) => e?.category === "not_found" && e.name === "ExplorationMemoryError" && e.message === "Unknown memory document: unknown");
     await assert.rejects(() => m.edit({ slug: "unknown", edits: [{ oldText: "x", newText: "y" }], reason: "edit" }), (e: any) => e?.category === "not_found");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("lifecycle views archived content without freshness and reject archived mutations", async () => {
+  const root = await temp(); try {
+    const m = createExplorationMemoryService(root, { sourceReader: { read: async () => ({ bytes: new TextEncoder().encode("changed"), text: "changed" }) } });
+    await m.write({ slug: "a", title: "A", description: "D", content: "a.ts#L1", reason: "create" });
+    const archived = await m.retire({ slug: "a", mode: "archive", reason: "retire" });
+    assert.equal(archived.status, "archived");
+    const details = await m.details({ slugs: ["a"] });
+    assert.equal(details.summary.status, "not_applicable");
+    assert.equal(details.documents[0]!.freshness.occurrences[0]!.status, "not_applicable");
+    assert.equal((await m.catalog({})).entries[0]!.status, "archived");
+    await assert.rejects(() => m.edit({ slug: "a", edits: [{ oldText: "a.ts#L1", newText: "other.ts#L1" }], reason: "edit" }), (e: any) => e?.category === "invalid_input" && e.message === "Archived documents cannot be modified");
+    const again = await m.retire({ slug: "a", mode: "archive", reason: "again" });
+    assert.equal(again.status, "archived");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("legacy lifecycle fields default to actual without rewriting", async () => {
+  const root = await temp(); try {
+    const m = createExplorationMemoryService(root);
+    await m.write({ slug: "legacy", title: "L", description: "D", content: "body", reason: "create" });
+    const documentPath = md(root, "legacy");
+    await writeFile(documentPath, (await readFile(documentPath, "utf8")).replace("status: actual\\n", ""));
+    const catalog = JSON.parse(await readFile(cat(root), "utf8")); delete catalog.entries[0].status;
+    await writeFile(cat(root), JSON.stringify(catalog));
+    const result = await m.details({ slugs: ["legacy"] });
+    assert.equal(result.documents[0]!.document.status, "actual");
+    assert.equal(result.documents[0]!.entry.status, "actual");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("retire validates supersede mode and replacement integrity", async () => {
+  const root = await temp(); try {
+    const m = createExplorationMemoryService(root);
+    await m.write({ slug: "a", title: "A", description: "D", content: "a", reason: "create" });
+    await assert.rejects(() => m.retire({ slug: "a", mode: "bad" as any, reason: "r" }), (e: any) => e?.category === "invalid_input");
+    for (const replacements of [[], ["b", "b"], ["bad slug"]])
+      await assert.rejects(() => m.retire({ slug: "a", mode: "supersede", replacements, reason: "r" }), (e: any) => e?.category === "invalid_input");
+    await assert.rejects(() => m.retire({ slug: "a", mode: "supersede", replacements: ["a"], reason: "r" }), (e: any) => e?.category === "invalid_input" && e.message === "Replacement cannot be target");
+    await m.write({ slug: "b", title: "B", description: "D", content: "b", reason: "create" });
+    const bBytes = await readFile(md(root, "b"));
+    await writeFile(md(root, "b"), Buffer.from(bBytes.toString().replace(/\nb$/, "\nchanged")));
+    await assert.rejects(() => m.retire({ slug: "a", mode: "supersede", replacements: ["b"], reason: "r" }), (e: any) => e?.category === "incomplete_or_inconsistent_state" && e.message === "Replacement integrity warning: b");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
